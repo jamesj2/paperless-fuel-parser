@@ -150,6 +150,76 @@ def update_custom_fields(doc_id: int, field_updates: list[dict]) -> None:
     )
 
 
+def get_correspondents() -> dict[str, int]:
+    """Return a dict mapping lowercase correspondent name -> id."""
+    corrs = get_all_pages("correspondents/")
+    return {c["name"].lower(): c["id"] for c in corrs}
+
+
+def _normalize(s: str) -> str:
+    """Normalize a string for fuzzy comparison."""
+    s = s.lower().strip()
+    s = re.sub(r"[^a-z0-9\s#]", "", s)  # keep alphanumeric, spaces, #
+    s = re.sub(r"\s+", " ", s)            # collapse whitespace
+    return s
+
+
+def _similarity(a: str, b: str) -> float:
+    """Simple similarity ratio between two strings (0.0 - 1.0)."""
+    a, b = _normalize(a), _normalize(b)
+    if a == b:
+        return 1.0
+    if not a or not b:
+        return 0.0
+    # Check if one contains the other
+    if a in b or b in a:
+        return 0.9
+    # Character-level similarity (Sørensen–Dice coefficient on bigrams)
+    def bigrams(s):
+        return {s[i : i + 2] for i in range(len(s) - 1)}
+    bg_a, bg_b = bigrams(a), bigrams(b)
+    if not bg_a or not bg_b:
+        return 0.0
+    return 2 * len(bg_a & bg_b) / (len(bg_a) + len(bg_b))
+
+
+def find_correspondent(name: str, corr_map: dict[str, int]) -> int | None:
+    """
+    Find a correspondent by name with fuzzy matching.
+    Returns the ID of the best match, or None if no good match found.
+    """
+    # Exact match first (case-insensitive)
+    normalized = name.strip().lower()
+    if normalized in corr_map:
+        return corr_map[normalized]
+
+    # Fuzzy match — find the best candidate above threshold
+    best_score = 0.0
+    best_id = None
+    for corr_name, corr_id in corr_map.items():
+        score = _similarity(name, corr_name)
+        if score > best_score:
+            best_score = score
+            best_id = corr_id
+
+    if best_score >= 0.7:
+        log.info("  Fuzzy matched correspondent '%s' (score=%.2f)", name, best_score)
+        return best_id
+
+    return None
+
+
+def create_correspondent(name: str) -> int:
+    """Create a new correspondent and return its ID."""
+    resp = api("POST", "correspondents/", json={"name": name})
+    return resp.json()["id"]
+
+
+def set_document_correspondent(doc_id: int, correspondent_id: int) -> None:
+    """Set the correspondent on a document."""
+    api("PATCH", f"documents/{doc_id}/", json={"correspondent": correspondent_id})
+
+
 # ---------------------------------------------------------------------------
 # Regex extraction (fallback)
 # ---------------------------------------------------------------------------
@@ -209,6 +279,65 @@ def extract_ppg_regex(text: str) -> str | None:
         match = re.search(pattern, text, re.IGNORECASE)
         if match:
             return f"{match.group(1)}.{match.group(2)}"
+
+    return None
+
+
+def extract_station_regex(text: str) -> str | None:
+    """
+    Extract the gas station name from receipt text.
+    Station names typically appear in the first few non-empty lines,
+    before the address and date.
+    """
+    lines = text.strip().split("\n")
+
+    # Skip common noise lines and look for a plausible station name
+    skip_patterns = re.compile(
+        r"^("
+        r"welcome\s+to|"       # "Welcome to Shell" -> we want "Shell"
+        r"date\b|time\b|"      # date/time lines
+        r"pump\s*#|"           # pump number
+        r"service\s+level|"    # service level
+        r"product\s*:|"        # product type
+        r"gallons|price|"      # data fields
+        r"total|sale|amount|"  # totals
+        r"visa|mastercard|"    # payment
+        r"credit|debit|"       # payment
+        r"auth\s*#|"           # auth codes
+        r"\d{5}|"              # zip codes
+        r"\(\d{3}\)\s*\d{3}|"  # phone numbers
+        r"\d{1,2}/\d{1,2}/\d"  # dates
+        r")",
+        re.IGNORECASE,
+    )
+
+    # "Welcome to Shell" -> extract "Shell"
+    welcome_pattern = re.compile(r"welcome\s+to\s+(.+)", re.IGNORECASE)
+
+    # Address line (digits at start = likely an address, not a name)
+    address_pattern = re.compile(r"^\d{2,6}\s+")
+
+    for line in lines[:10]:
+        line = line.strip()
+        if not line or len(line) < 3:
+            continue
+
+        # Check for "Welcome to <name>"
+        wm = welcome_pattern.match(line)
+        if wm:
+            return wm.group(1).strip()
+
+        # Skip lines that look like addresses, dates, fields, etc.
+        if address_pattern.match(line):
+            continue
+        if skip_patterns.search(line):
+            continue
+        # Skip lines that are just numbers or codes
+        if re.match(r"^[\d\s\-#]+$", line):
+            continue
+
+        # This is likely the station name
+        return line.strip()
 
     return None
 
@@ -299,6 +428,7 @@ def extract_with_regex(text: str) -> dict:
         "total": extract_total_regex(text),
         "address": extract_address_regex(text),
         "ppg": extract_ppg_regex(text),
+        "station": extract_station_regex(text),
     }
 
 
@@ -314,6 +444,7 @@ From the receipt text below, extract:
 2. **Total**: The total dollar amount paid for fuel (numeric, e.g. "45.67")
 3. **Address**: The street address of the gas station (e.g. "123 Main St, Springfield, IL 62704")
 4. **Price Per Gallon**: The price per gallon of fuel (numeric, e.g. "3.199")
+5. **Station**: The name of the gas station (e.g. "Shell", "QuikTrip #80656")
 
 Rules:
 - For Gallons, return ONLY the numeric value (no units).
@@ -322,6 +453,8 @@ Rules:
 - For Price Per Gallon (ppg), return ONLY the numeric value (no dollar sign).
   It is often labeled PRICE/G, PRICE/GAL, or PPG on receipts.
   OCR may misread it (e.g. "fo." instead of "$0." or "/Q" instead of "/G").
+- For Station, return the gas station brand/name, including store number if present.
+  It usually appears at the very top of the receipt. "Welcome to X" means the station is "X".
 - If a field cannot be determined, return null for that field.
 - Return ONLY valid JSON, no other text.
 
@@ -330,7 +463,8 @@ Return your answer as JSON:
   "gallons": "12.345",
   "total": "45.67",
   "address": "123 Main St, Springfield, IL 62704",
-  "ppg": "3.199"
+  "ppg": "3.199",
+  "station": "FAS-TRIP #107"
 }
 
 Receipt text:
@@ -420,6 +554,7 @@ def _parse_llm_json(raw: str) -> dict | None:
             "total": data.get("total"),
             "address": data.get("address"),
             "ppg": data.get("ppg"),
+            "station": data.get("station"),
         }
     except json.JSONDecodeError:
         log.error("Failed to parse LLM JSON: %s", raw[:200])
@@ -453,7 +588,7 @@ def extract_fields(text: str) -> dict:
     Extract Gallons, Total, Address, and Price Per Gallon from receipt text.
     Tries LLM first (unless REGEX_ONLY), then fills gaps with regex.
     """
-    result = {"gallons": None, "total": None, "address": None, "ppg": None}
+    result = {"gallons": None, "total": None, "address": None, "ppg": None, "station": None}
 
     # Try LLM first
     if not REGEX_ONLY:
@@ -501,21 +636,32 @@ def fields_to_fill(doc: dict, field_map: dict[str, dict]) -> list[str]:
     return empty
 
 
-def process_document(doc_id: int, field_map: dict[str, dict], dry_run: bool = False) -> bool:
+def process_document(
+    doc_id: int,
+    field_map: dict[str, dict],
+    corr_map: dict[str, int] | None = None,
+    dry_run: bool = False,
+) -> bool:
     """
-    Process a single document: extract data and update custom fields.
-    Returns True if any fields were updated.
+    Process a single document: extract data, update custom fields,
+    and set correspondent if missing.
+    Returns True if any changes were made.
     """
     doc = get_document(doc_id)
     title = doc.get("title", f"doc #{doc_id}")
     log.info("Processing: %s (id=%d)", title, doc_id)
 
     empty_fields = fields_to_fill(doc, field_map)
-    if not empty_fields:
+    needs_correspondent = doc.get("correspondent") is None
+
+    if not empty_fields and not needs_correspondent:
         log.info("  All fields already filled, skipping")
         return False
 
-    log.info("  Empty fields: %s", ", ".join(empty_fields))
+    if empty_fields:
+        log.info("  Empty fields: %s", ", ".join(empty_fields))
+    if needs_correspondent:
+        log.info("  Missing correspondent")
 
     content = doc.get("content", "")
     if not content.strip():
@@ -525,7 +671,9 @@ def process_document(doc_id: int, field_map: dict[str, dict], dry_run: bool = Fa
     extracted = extract_fields(content)
     log.info("  Extracted: %s", extracted)
 
-    # Map extracted values -> field name -> Paperless custom field format
+    changed = False
+
+    # --- Update custom fields ---
     name_to_key = {
         FIELD_GALLONS: "gallons",
         FIELD_TOTAL: "total",
@@ -557,17 +705,41 @@ def process_document(doc_id: int, field_map: dict[str, dict], dry_run: bool = Fa
         updates.append({"field": field_info["id"], "value": value})
         log.info("  Will set %s = %s", field_name, value)
 
-    if not updates:
-        log.info("  Nothing to update")
-        return False
+    if updates:
+        if dry_run:
+            log.info("  [DRY RUN] Would update %d field(s)", len(updates))
+        else:
+            update_custom_fields(doc_id, updates)
+            log.info("  Updated %d field(s)", len(updates))
+        changed = True
 
-    if dry_run:
-        log.info("  [DRY RUN] Would update %d field(s)", len(updates))
-        return True
+    # --- Set correspondent if missing ---
+    if needs_correspondent and extracted.get("station"):
+        station_name = extracted["station"]
+        if corr_map is None:
+            corr_map = get_correspondents()
 
-    update_custom_fields(doc_id, updates)
-    log.info("  Updated %d field(s)", len(updates))
-    return True
+        corr_id = find_correspondent(station_name, corr_map)
+
+        if corr_id:
+            log.info("  Will set correspondent to existing: '%s' (id=%d)", station_name, corr_id)
+        else:
+            log.info("  Correspondent '%s' not found, will create", station_name)
+
+        if dry_run:
+            log.info("  [DRY RUN] Would set correspondent")
+        else:
+            if not corr_id:
+                corr_id = create_correspondent(station_name)
+                corr_map[station_name.strip().lower()] = corr_id
+                log.info("  Created correspondent '%s' (id=%d)", station_name, corr_id)
+            set_document_correspondent(doc_id, corr_id)
+            log.info("  Set correspondent (id=%d)", corr_id)
+        changed = True
+    elif needs_correspondent:
+        log.warning("  Could not extract station name for correspondent")
+
+    return changed
 
 
 # ---------------------------------------------------------------------------
@@ -589,6 +761,8 @@ def run_batch(dry_run: bool = False) -> None:
             )
             sys.exit(1)
 
+    corr_map = get_correspondents()
+
     doc_type_id = get_document_type_id(DOCTYPE_NAME)
     if doc_type_id is None:
         log.error("Document type '%s' not found", DOCTYPE_NAME)
@@ -600,7 +774,7 @@ def run_batch(dry_run: bool = False) -> None:
 
     updated = 0
     for doc in documents:
-        if process_document(doc["id"], field_map, dry_run=dry_run):
+        if process_document(doc["id"], field_map, corr_map=corr_map, dry_run=dry_run):
             updated += 1
 
     log.info("Done. Updated %d / %d document(s).", updated, len(documents))
@@ -615,7 +789,8 @@ def run_single(doc_id: int, dry_run: bool = False) -> None:
             log.error("Custom field '%s' not found in Paperless-ngx.", name)
             sys.exit(1)
 
-    process_document(doc_id, field_map, dry_run=dry_run)
+    corr_map = get_correspondents()
+    process_document(doc_id, field_map, corr_map=corr_map, dry_run=dry_run)
 
 
 # ---------------------------------------------------------------------------
