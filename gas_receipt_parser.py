@@ -44,6 +44,7 @@ DOCTYPE_NAME = os.getenv("PAPERLESS_DOCTYPE_NAME", "Car: Fuel Receipt")
 FIELD_GALLONS = os.getenv("FIELD_GALLONS", "Gallons")
 FIELD_TOTAL = os.getenv("FIELD_TOTAL", "Total")
 FIELD_ADDRESS = os.getenv("FIELD_ADDRESS", "Address")
+FIELD_PPG = os.getenv("FIELD_PPG", "Price Per Gallon")
 
 LLM_PROVIDER = os.getenv("LLM_PROVIDER", "gemini").lower()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
@@ -184,6 +185,29 @@ def extract_total_regex(text: str) -> str | None:
     return None
 
 
+def extract_ppg_regex(text: str) -> str | None:
+    """Extract price per gallon from receipt text."""
+    patterns = [
+        # "PRICE/G: $3.199" or "PRICE/G $3.199" (common on FAS-TRIP)
+        # Also handles OCR space in "$3 .299" -> "$3.299"
+        r"PRICE\s*/\s*[GQ]\s*[:\s]*\$?\s*(\d{1,2})\s*\.(\d{2,4})",
+        # "PRICE/GAL: $3.199"
+        r"PRICE\s*/\s*GAL(?:LON)?\s*[:\s]*\$?\s*(\d{1,2})\s*\.(\d{2,4})",
+        # "PPG: $3.199" or "PPG $3.199"
+        r"PPG\s*[:\s]*\$?\s*(\d{1,2})\s*\.(\d{2,4})",
+        # "@ $3.199/G" or "@ 3.199/GAL"
+        r"@\s*\$?\s*(\d{1,2})\s*\.(\d{2,4})\s*/\s*G(?:AL)?",
+        # "$3.199/GAL"
+        r"\$(\d{1,2})\s*\.(\d{2,4})\s*/\s*GAL(?:LON)?",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            return f"{match.group(1)}.{match.group(2)}"
+
+    return None
+
+
 def _clean_ocr_line(line: str) -> str:
     """Remove common OCR artifacts from a line."""
     # Strip stray $, #, *, and trailing/leading whitespace
@@ -269,6 +293,7 @@ def extract_with_regex(text: str) -> dict:
         "gallons": extract_gallons_regex(text),
         "total": extract_total_regex(text),
         "address": extract_address_regex(text),
+        "ppg": extract_ppg_regex(text),
     }
 
 
@@ -283,11 +308,15 @@ From the receipt text below, extract:
 1. **Gallons**: The number of gallons of fuel purchased (numeric, e.g. "12.345")
 2. **Total**: The total dollar amount paid for fuel (numeric, e.g. "45.67")
 3. **Address**: The street address of the gas station (e.g. "123 Main St, Springfield, IL 62704")
+4. **Price Per Gallon**: The price per gallon of fuel (numeric, e.g. "3.199")
 
 Rules:
 - For Gallons, return ONLY the numeric value (no units).
 - For Total, return ONLY the numeric value (no dollar sign).
 - For Address, include street, city, state, and zip if available.
+- For Price Per Gallon (ppg), return ONLY the numeric value (no dollar sign).
+  It is often labeled PRICE/G, PRICE/GAL, or PPG on receipts.
+  OCR may misread it (e.g. "fo." instead of "$0." or "/Q" instead of "/G").
 - If a field cannot be determined, return null for that field.
 - Return ONLY valid JSON, no other text.
 
@@ -295,7 +324,8 @@ Return your answer as JSON:
 {
   "gallons": "12.345",
   "total": "45.67",
-  "address": "123 Main St, Springfield, IL 62704"
+  "address": "123 Main St, Springfield, IL 62704",
+  "ppg": "3.199"
 }
 
 Receipt text:
@@ -384,6 +414,7 @@ def _parse_llm_json(raw: str) -> dict | None:
             "gallons": data.get("gallons"),
             "total": data.get("total"),
             "address": data.get("address"),
+            "ppg": data.get("ppg"),
         }
     except json.JSONDecodeError:
         log.error("Failed to parse LLM JSON: %s", raw[:200])
@@ -414,10 +445,10 @@ def extract_with_llm(text: str) -> dict | None:
 
 def extract_fields(text: str) -> dict:
     """
-    Extract Gallons, Total, and Address from receipt text.
+    Extract Gallons, Total, Address, and Price Per Gallon from receipt text.
     Tries LLM first (unless REGEX_ONLY), then fills gaps with regex.
     """
-    result = {"gallons": None, "total": None, "address": None}
+    result = {"gallons": None, "total": None, "address": None, "ppg": None}
 
     # Try LLM first
     if not REGEX_ONLY:
@@ -450,7 +481,7 @@ def fields_to_fill(doc: dict, field_map: dict[str, dict]) -> list[str]:
     Determine which of our target fields are empty on this document.
     Returns list of field names that need filling.
     """
-    target_names = [FIELD_GALLONS, FIELD_TOTAL, FIELD_ADDRESS]
+    target_names = [FIELD_GALLONS, FIELD_TOTAL, FIELD_ADDRESS, FIELD_PPG]
     existing = {cf["field"]: cf["value"] for cf in doc.get("custom_fields", [])}
 
     empty = []
@@ -494,6 +525,7 @@ def process_document(doc_id: int, field_map: dict[str, dict], dry_run: bool = Fa
         FIELD_GALLONS: "gallons",
         FIELD_TOTAL: "total",
         FIELD_ADDRESS: "address",
+        FIELD_PPG: "ppg",
     }
 
     updates = []
@@ -508,8 +540,8 @@ def process_document(doc_id: int, field_map: dict[str, dict], dry_run: bool = Fa
 
         # Convert value to match the Paperless field data type
         if field_info["data_type"] == "monetary":
-            # Monetary fields expect a string representation of the decimal value
-            value = str(value)
+            # Monetary fields require "USD" prefix + exactly 2 decimal places
+            value = f"USD{float(value):.2f}"
         elif field_info["data_type"] == "float":
             value = float(value)
         elif field_info["data_type"] == "integer":
@@ -543,7 +575,7 @@ def run_batch(dry_run: bool = False) -> None:
     field_map = get_custom_fields()
 
     # Validate that the expected fields exist
-    for name in [FIELD_GALLONS, FIELD_TOTAL, FIELD_ADDRESS]:
+    for name in [FIELD_GALLONS, FIELD_TOTAL, FIELD_ADDRESS, FIELD_PPG]:
         if name not in field_map:
             log.error(
                 "Custom field '%s' not found in Paperless-ngx. "
@@ -573,7 +605,7 @@ def run_single(doc_id: int, dry_run: bool = False) -> None:
     """Process a single document by ID."""
     field_map = get_custom_fields()
 
-    for name in [FIELD_GALLONS, FIELD_TOTAL, FIELD_ADDRESS]:
+    for name in [FIELD_GALLONS, FIELD_TOTAL, FIELD_ADDRESS, FIELD_PPG]:
         if name not in field_map:
             log.error("Custom field '%s' not found in Paperless-ngx.", name)
             sys.exit(1)
