@@ -28,6 +28,11 @@ import sys
 import time
 from pathlib import Path
 
+# Add local vendor directory to path (for containerized installs)
+_vendor_dir = Path(__file__).parent / "vendor"
+if _vendor_dir.is_dir():
+    sys.path.insert(0, str(_vendor_dir))
+
 import requests
 from dotenv import load_dotenv
 
